@@ -1,0 +1,74 @@
+name: Update bun-baseline hashes
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Fetch latest bun releases and update hashes
+        run: |
+          set -euo pipefail
+
+          # Fetch the 10 most recent releases from GitHub API
+          RELEASES=$(curl -sf https://api.github.com/repos/oven-sh/bun/releases?per_page=10 \
+            | jq -r '.[].tag_name | select(startswith("bun-v")) | ltrimstr("bun-v")')
+
+          # Load existing hashes
+          HASHES=$(cat hashes.json)
+
+          UPDATED=false
+          for VERSION in $RELEASES; do
+            # Skip if we already have this version
+            if echo "$HASHES" | jq -e --arg v "$VERSION" '.[$v]' > /dev/null 2>&1; then
+              echo "Already have hash for v${VERSION}, skipping"
+              continue
+            fi
+
+            URL="https://github.com/oven-sh/bun/releases/download/bun-v${VERSION}/bun-linux-x64-baseline.zip"
+
+            # Check if the baseline asset exists for this release
+            if ! curl -sfIL "$URL" > /dev/null 2>&1; then
+              echo "No baseline asset for v${VERSION}, skipping"
+              continue
+            fi
+
+            echo "Prefetching bun-baseline v${VERSION}..."
+            HASH=$(nix store prefetch-file --json "$URL" | jq -r '.hash')
+
+            # Add to hashes object
+            HASHES=$(echo "$HASHES" | jq --arg v "$VERSION" --arg h "$HASH" '. + {($v): $h}')
+            UPDATED=true
+            echo "Added hash for v${VERSION}: ${HASH}"
+          done
+
+          if [ "$UPDATED" = true ]; then
+            # Write sorted hashes back
+            echo "$HASHES" | jq -S '.' > hashes.json
+            echo "hashes_updated=true" >> "$GITHUB_ENV"
+          else
+            echo "No new versions found"
+            echo "hashes_updated=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Commit and push
+        if: env.hashes_updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add hashes.json
+          git diff --staged --quiet && exit 0
+          git commit -m "chore: update bun-baseline hashes"
+          git push
